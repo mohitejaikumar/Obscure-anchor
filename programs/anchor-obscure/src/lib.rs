@@ -247,21 +247,22 @@ pub mod isolated_lending {
         require_keys_eq!(p.user, ctx.accounts.user.key(), ErrorCode::AccountMismatch);
         require!(p.supply_shares >= amount, ErrorCode::InsufficientShares);
 
-        // Hypothetical redeem: check LTV and health using aggregate across all markets passed
+        // Hypothetical redeem: check LTV and health in single market
         {
             let controller = &ctx.accounts.controller;
-            let remaining = ctx.remaining_accounts;
             enforce_borrow_power_after_hypo_redeem(
                 controller,
-                remaining,
-                (market.key(), amount, amount),
-                ctx.accounts.collateral_mint.decimals,
+                market,
+                p,
+                &ctx.accounts.oracle.to_account_info(),
+                amount,
             )?;
             enforce_health_after_hypo_redeem(
                 controller,
-                remaining,
-                (market.key(), amount, amount),
-                ctx.accounts.collateral_mint.decimals,
+                market,
+                p,
+                &ctx.accounts.oracle.to_account_info(),
+                amount,
             )?;
         }
 
@@ -300,21 +301,22 @@ pub mod isolated_lending {
         // Ensure liquidity available
         require!(ctx.accounts.vault_borrow_liquidity.amount >= amount, ErrorCode::InsufficientLiquidity);
 
-        // Hypothetical new borrow: check borrow power and health
+        // Hypothetical new borrow: check borrow power and health in single market
         {
             let controller = &ctx.accounts.controller;
-            let remaining = ctx.remaining_accounts;
             enforce_borrow_power_after_hypo_borrow(
                 controller,
-                remaining,
-                (market.key(), amount),
-                ctx.accounts.borrow_mint.decimals,
+                market,
+                p,
+                &ctx.accounts.oracle.to_account_info(),
+                amount,
             )?;
             enforce_health_after_hypo_borrow(
                 controller,
-                remaining,
-                (market.key(), amount),
-                ctx.accounts.borrow_mint.decimals,
+                market,
+                p,
+                &ctx.accounts.oracle.to_account_info(),
+                amount,
             )?;
         }
 
@@ -398,22 +400,25 @@ pub mod isolated_lending {
     }
 
     // LIQUIDATION: repay borrow on behalf of unhealthy user, seize collateral with incentive
-    pub fn liquidate<'info>(
-        ctx: Context<'_, '_, 'info, 'info, Liquidate<'info>>,
+    pub fn liquidate(
+        ctx: Context<'_, '_, '_, '_, Liquidate>,
         repay_amount_requested: u64,
-        // price feeds provided in remaining accounts: triplets (market, user_position, oracle) for all registry markets
     ) -> Result<()> {
         require!(repay_amount_requested > 0, ErrorCode::InvalidAmount);
 
         let controller = &ctx.accounts.controller;
-        let registry = &ctx.accounts.registry;
         let market = &mut ctx.accounts.market; // the borrow market of the user
         update_interest(market)?;
 
-        // Ensure user is liquidatable in aggregate
+        // Ensure user is liquidatable in single market
         {
-            let remaining = ctx.remaining_accounts;
-            ensure_liquidatable(controller, registry, remaining)?;
+            let violator = &ctx.accounts.violator_position;
+            ensure_liquidatable(
+                controller,
+                market,
+                violator,
+                &ctx.accounts.borrow_oracle,
+            )?;
         }
 
         // Close factor throttles max repay per tx
@@ -814,6 +819,10 @@ pub struct BorrowerWithdraw<'info> {
     pub user: Signer<'info>,
 
     pub collateral_mint: Account<'info, Mint>,
+    
+    /// CHECK: Oracle account for price feed
+    pub oracle: UncheckedAccount<'info>,
+    
     pub token_program: Program<'info, Token>,
 }
 
@@ -852,6 +861,9 @@ pub struct BorrowerBorrow<'info> {
     pub user: Signer<'info>,
 
     pub borrow_mint: Account<'info, Mint>,
+
+    /// CHECK: Oracle account for price feed
+    pub oracle: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -892,7 +904,6 @@ pub struct BorrowerRepay<'info> {
 #[derive(Accounts)]
 pub struct Liquidate<'info> {
     pub controller: Account<'info, Controller>,
-    pub registry: Account<'info, UserRegistry>,
 
     #[account(mut)]
     pub market: Account<'info, Market>,
@@ -1137,28 +1148,6 @@ fn get_price_checked(
     Ok(1_0000_0000u128) // 1e8 scale; replace
 }
 
-// Registry validation for liquidation passes: remaining accounts triplets
-fn validate_against_registry<'info>(
-    registry: &Account<'info, UserRegistry>,
-    remaining: &'info [AccountInfo<'info>],
-) -> Result<()> {
-    require!(remaining.len() % 3 == 0, ErrorCode::AccountMismatch);
-    let mut provided: Vec<Pubkey> = Vec::new();
-    let mut i = 0;
-    while i < remaining.len() {
-        let m_ai = &remaining[i];
-        let market: Account<Market> =
-            Account::try_from(m_ai).map_err(|_| ErrorCode::AccountMismatch)?;
-        provided.push(market.key());
-        i += 3;
-    }
-    for idx in 0..registry.count as usize {
-        let mk = registry.markets[idx];
-        require!(provided.contains(&mk), ErrorCode::RegistryMismatch);
-    }
-    Ok(())
-}
-
 fn value_usd_from_underlying(amount: u64, price: u128, decimals: u8) -> Result<u128> {
     let scale = 10u128.pow(decimals as u32);
     let v = (amount as u128)
@@ -1167,184 +1156,152 @@ fn value_usd_from_underlying(amount: u64, price: u128, decimals: u8) -> Result<u
     Ok(v)
 }
 
-fn aggregate_portfolio_from_remaining<'info>(
-    controller: &Account<'info, Controller>,
-    remaining: &'info [AccountInfo<'info>],
-    hypo_redeem: Option<(Pubkey, u64, u64, u8)>, // (market, shares, underlying, decimals)
-    hypo_new_borrow: Option<(Pubkey, u64, u8)>,  // (market, amount, decimals)
-    use_ltv: bool,
-) -> Result<(u128, u128, Pubkey)> {
-    require!(remaining.len() % 3 == 0, ErrorCode::AccountMismatch);
-    if remaining.is_empty() {
-        return Ok((0, 0, controller.authority));
+// Single-market health check: calculates collateral value and debt value in USD
+// Returns (collateral_value_adjusted, debt_value)
+fn calculate_single_market_health(
+    controller: &Account<Controller>,
+    market: &Account<Market>,
+    position: &Account<UserPosition>,
+    oracle: &AccountInfo,
+    hypo_redeem_shares: Option<u64>,  // hypothetical collateral withdrawal
+    hypo_new_borrow: Option<u64>,     // hypothetical new borrow amount
+    use_ltv: bool,  // true = use collateral_factor, false = use liquidation_threshold
+) -> Result<(u128, u128)> {
+    let price_collateral_usd = get_price_checked(controller, market, oracle)?;
+    let price_borrow_usd = price_collateral_usd; // Using same oracle for both (can extend to two oracles if needed)
+
+    // Calculate collateral value (adjusted by factor)
+    let mut collateral_shares = position.supply_shares;
+    if let Some(redeem) = hypo_redeem_shares {
+        collateral_shares = collateral_shares.saturating_sub(redeem);
     }
 
-    let mut total_debt_value: u128 = 0;
-    let mut total_collateral_value_limit: u128 = 0;
-    let mut inferred_user: Option<Pubkey> = None;
-
-    let mut i = 0;
-    while i < remaining.len() {
-        let m_ai = &remaining[i];
-        let p_ai = &remaining[i + 1];
-        let o_ai = &remaining[i + 2];
-
-        let mut market: Account<Market> =
-            Account::try_from(m_ai).map_err(|_| ErrorCode::AccountMismatch)?;
-        let position: Account<UserPosition> =
-            Account::try_from(p_ai).map_err(|_| ErrorCode::AccountMismatch)?;
-
-        require_keys_eq!(position.market, market.key(), ErrorCode::AccountMismatch);
-
-        let user_pk = if let Some(pk) = inferred_user {
-            pk
+    let collateral_value = if position.collateral_enabled && collateral_shares > 0 {
+        let value_usd = value_usd_from_underlying(collateral_shares, price_collateral_usd, market.mint_decimals)?;
+        let factor_bps = if use_ltv {
+            market.collateral_factor_bps
         } else {
-            let pk = position.user;
-            inferred_user = Some(pk);
-            pk
-        };
-        require_keys_eq!(position.user, user_pk, ErrorCode::AccountMismatch);
+            market.liquidation_threshold_bps
+        } as u128;
+        value_usd
+            .checked_mul(factor_bps).ok_or(ErrorCode::MathError)?
+            .checked_div(BASIS_POINTS as u128).ok_or(ErrorCode::MathError)?
+    } else {
+        0
+    };
 
-        require_keys_eq!(o_ai.key(), market.oracle, ErrorCode::InvalidOracle);
-
-        update_interest(&mut market)?;
-
-        let price_usd = get_price_checked(controller, &market, o_ai)?;
-
-        // Collateral
-        if position.collateral_enabled && position.supply_shares > 0 {
-            // For collateral, shares are 1:1 with underlying units
-            let underlying = position.supply_shares;
-
-            let value_usd = value_usd_from_underlying(underlying, price_usd, market.mint_decimals)?;
-            let factor_bps = if use_ltv {
-                market.collateral_factor_bps
-            } else {
-                market.liquidation_threshold_bps
-            } as u128;
-
-            let allowed = value_usd
-                .checked_mul(factor_bps).ok_or(ErrorCode::MathError)?
-                .checked_div(BASIS_POINTS as u128).ok_or(ErrorCode::MathError)?;
-            total_collateral_value_limit = total_collateral_value_limit
-                .checked_add(allowed).ok_or(ErrorCode::MathError)?;
-        }
-
-        // Debt
-        let accrued = accrue_debt(&position, &market)?;
-        if accrued > 0 {
-            let debt_usd = value_usd_from_underlying(accrued as u64, price_usd, market.mint_decimals)?;
-            total_debt_value = total_debt_value.checked_add(debt_usd).ok_or(ErrorCode::MathError)?;
-        }
-
-        // Hypo redeem
-        if let Some((redeem_mkt, _redeem_shares, redeem_underlying, redeem_decimals)) = hypo_redeem {
-            if redeem_mkt == market.key() && position.collateral_enabled {
-                let redeem_value_usd = value_usd_from_underlying(redeem_underlying, price_usd, redeem_decimals)?;
-                let factor_bps = if use_ltv {
-                    market.collateral_factor_bps
-                } else {
-                    market.liquidation_threshold_bps
-                } as u128;
-                let reduce = redeem_value_usd
-                    .checked_mul(factor_bps).ok_or(ErrorCode::MathError)?
-                    .checked_div(BASIS_POINTS as u128).ok_or(ErrorCode::MathError)?;
-                total_collateral_value_limit = total_collateral_value_limit.saturating_sub(reduce);
-            }
-        }
-
-        // Hypo new borrow
-        if let Some((borrow_mkt, borrow_amount, borrow_decimals)) = hypo_new_borrow {
-            if borrow_mkt == market.key() && borrow_amount > 0 {
-                let borrow_value_usd = value_usd_from_underlying(borrow_amount, price_usd, borrow_decimals)?;
-                total_debt_value = total_debt_value.checked_add(borrow_value_usd).ok_or(ErrorCode::MathError)?;
-            }
-        }
-
-        i += 3;
+    // Calculate debt value
+    let current_debt = accrue_debt(position, market)?;
+    let mut total_debt = current_debt;
+    if let Some(new_borrow) = hypo_new_borrow {
+        total_debt = total_debt.checked_add(new_borrow as u128).ok_or(ErrorCode::MathError)?;
     }
 
-    let final_user = inferred_user.unwrap_or(controller.authority);
-    Ok((total_debt_value, total_collateral_value_limit, final_user))
+    let debt_value = if total_debt > 0 {
+        value_usd_from_underlying(total_debt as u64, price_borrow_usd, market.mint_decimals)?
+    } else {
+        0
+    };
+
+    Ok((collateral_value, debt_value))
 }
 
-fn enforce_borrow_power_after_hypo_redeem<'info>(
-    controller: &Account<'info, Controller>,
-    remaining: &'info [AccountInfo<'info>],
-    hypo_redeem: (Pubkey, u64, u64),
-    decimals: u8,
+fn enforce_borrow_power_after_hypo_redeem(
+    controller: &Account<Controller>,
+    market: &Account<Market>,
+    position: &Account<UserPosition>,
+    oracle: &AccountInfo,
+    hypo_redeem_shares: u64,
 ) -> Result<()> {
-    let (total_debt, total_borrow_power, _user) = aggregate_portfolio_from_remaining(
+    let (collateral_value, debt_value) = calculate_single_market_health(
         controller,
-        remaining,
-        Some((hypo_redeem.0, hypo_redeem.1, hypo_redeem.2, decimals)),
+        market,
+        position,
+        oracle,
+        Some(hypo_redeem_shares),
         None,
-        true,
+        true,  // use LTV (collateral_factor)
     )?;
-    require!(total_debt <= total_borrow_power, ErrorCode::InsufficientCollateral);
+    require!(debt_value <= collateral_value, ErrorCode::InsufficientCollateral);
     Ok(())
 }
 
-fn enforce_health_after_hypo_redeem<'info>(
-    controller: &Account<'info, Controller>,
-    remaining: &'info [AccountInfo<'info>],
-    hypo_redeem: (Pubkey, u64, u64),
-    decimals: u8,
+fn enforce_health_after_hypo_redeem(
+    controller: &Account<Controller>,
+    market: &Account<Market>,
+    position: &Account<UserPosition>,
+    oracle: &AccountInfo,
+    hypo_redeem_shares: u64,
 ) -> Result<()> {
-    let (total_debt, total_threshold, _user) = aggregate_portfolio_from_remaining(
+    let (collateral_value, debt_value) = calculate_single_market_health(
         controller,
-        remaining,
-        Some((hypo_redeem.0, hypo_redeem.1, hypo_redeem.2, decimals)),
+        market,
+        position,
+        oracle,
+        Some(hypo_redeem_shares),
         None,
-        false,
+        false,  // use liquidation threshold
     )?;
-    require!(total_debt <= total_threshold, ErrorCode::Unhealthy);
+    require!(debt_value <= collateral_value, ErrorCode::Unhealthy);
     Ok(())
 }
 
-fn enforce_borrow_power_after_hypo_borrow<'info>(
-    controller: &Account<'info, Controller>,
-    remaining: &'info [AccountInfo<'info>],
-    hypo_borrow: (Pubkey, u64),
-    decimals: u8,
+fn enforce_borrow_power_after_hypo_borrow(
+    controller: &Account<Controller>,
+    market: &Account<Market>,
+    position: &Account<UserPosition>,
+    oracle: &AccountInfo,
+    hypo_new_borrow: u64,
 ) -> Result<()> {
-    let (total_debt, total_borrow_power, _user) = aggregate_portfolio_from_remaining(
+    let (collateral_value, debt_value) = calculate_single_market_health(
         controller,
-        remaining,
+        market,
+        position,
+        oracle,
         None,
-        Some((hypo_borrow.0, hypo_borrow.1, decimals)),
-        true,
+        Some(hypo_new_borrow),
+        true,  // use LTV (collateral_factor)
     )?;
-    require!(total_debt <= total_borrow_power, ErrorCode::InsufficientCollateral);
+    require!(debt_value <= collateral_value, ErrorCode::InsufficientCollateral);
     Ok(())
 }
 
-fn enforce_health_after_hypo_borrow<'info>(
-    controller: &Account<'info, Controller>,
-    remaining: &'info [AccountInfo<'info>],
-    hypo_borrow: (Pubkey, u64),
-    decimals: u8,
+fn enforce_health_after_hypo_borrow(
+    controller: &Account<Controller>,
+    market: &Account<Market>,
+    position: &Account<UserPosition>,
+    oracle: &AccountInfo,
+    hypo_new_borrow: u64,
 ) -> Result<()> {
-    let (total_debt, total_threshold, _user) = aggregate_portfolio_from_remaining(
+    let (collateral_value, debt_value) = calculate_single_market_health(
         controller,
-        remaining,
+        market,
+        position,
+        oracle,
         None,
-        Some((hypo_borrow.0, hypo_borrow.1, decimals)),
-        false,
+        Some(hypo_new_borrow),
+        false,  // use liquidation threshold
     )?;
-    require!(total_debt <= total_threshold, ErrorCode::Unhealthy);
+    require!(debt_value <= collateral_value, ErrorCode::Unhealthy);
     Ok(())
 }
 
-fn ensure_liquidatable<'info>(
-    controller: &Account<'info, Controller>,
-    registry: &Account<'info, UserRegistry>,
-    remaining: &'info [AccountInfo<'info>],
+fn ensure_liquidatable(
+    controller: &Account<Controller>,
+    market: &Account<Market>,
+    position: &Account<UserPosition>,
+    oracle: &AccountInfo,
 ) -> Result<()> {
-    validate_against_registry(registry, remaining)?;
-    let (total_debt, total_threshold, _user) =
-        aggregate_portfolio_from_remaining(controller, remaining, None, None, false)?;
-    require!(total_debt > total_threshold, ErrorCode::NotLiquidatable);
+    let (collateral_value, debt_value) = calculate_single_market_health(
+        controller,
+        market,
+        position,
+        oracle,
+        None,
+        None,
+        false,  // use liquidation threshold
+    )?;
+    require!(debt_value > collateral_value, ErrorCode::NotLiquidatable);
     Ok(())
 }
 
